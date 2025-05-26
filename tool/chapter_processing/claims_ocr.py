@@ -102,12 +102,15 @@ def merge_cross_page_paragraphs(all_paragraphs):
 
     for i in range(len(all_paragraphs)):
         para = all_paragraphs[i].strip()
-        if not para:
+        if not para: # 跳过空字符串，这很重要，特别是您移除了 raw_paragraphs.append("") 后
             continue
 
         # 如果上一段不以句号等结尾，当前段不缩进，拼接
+        # 并且确保 merged 列表不为空
         if merged:
             last = merged[-1]
+            # 这里的逻辑是为了确保连续的文本能够合并，如果上一段不以句号等结尾
+            # 并且当前段落不是显式缩进（起始不带空格），则合并
             if not last.endswith(("。", "！", "？", "；")) and not para.startswith((" ", "\u3000", "　")):
                 merged[-1] = last + para  # 拼接
                 continue
@@ -137,18 +140,25 @@ def extract_text_from_pdf(pdf_path, output_path):
             paragraphs = ocr_paragraph_rebuild(ocr_result)
 
         raw_paragraphs.extend(paragraphs)
-        raw_paragraphs.append("")  # 保留空行便于结构分析
+        # raw_paragraphs.append("")  # 移除或注释掉此行，它会导致额外的空行
 
     # 合并跨页自然段
+    # 在调用 merge_cross_page_paragraphs 之前，最好清理一下 raw_paragraphs 中的空字符串，
+    # 以免影响后续的合并逻辑，尤其是在移除了 append("") 之后。
+    # 虽然 merge_cross_page_paragraphs 中有 `if not para: continue`，
+    # 但提前清理可以使数据更纯净。
+    # filtered_paragraphs = [p for p in raw_paragraphs if p.strip()] # 考虑是否需要这一步
+    # final_paragraphs = merge_cross_page_paragraphs(filtered_paragraphs)
     final_paragraphs = merge_cross_page_paragraphs(raw_paragraphs)
 
+
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(final_paragraphs))
+        f.write("\n".join(final_paragraphs)) # 将 \n\n 修改为 \n
 
     print(f"\n提取完成，保存到: {output_path}")
 
 if __name__ == "__main__":
-    input_pdf_path = r"/workspace/split_pdfs/CN111964678B/claims/claims.pdf"
+    input_pdf_path = r"/workspace/project/split_pdfs/CN111964678B/claims/claims.pdf"
     output_text_path = "claims.txt"
 
     if not os.path.exists(input_pdf_path):
