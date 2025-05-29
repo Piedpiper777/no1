@@ -1,144 +1,454 @@
-import os
 import fitz  # PyMuPDF
-from pdf2image import convert_from_path
-from PIL import Image
-import pytesseract
-from collections import defaultdict
+import os
+import cv2
+import numpy as np
+from paddleocr import PaddleOCR
+import argparse
+from typing import List, Tuple, Dict
+import re
 
-# 页眉关键词分类
-HEADER_KEYWORDS = {
-    "drawings": ["附", "图","附图"],
-    "description": ["说", "明", "说明书", "说明", "明书"],
-    "claims": [ "要", "求", "要求", "权利"],
-    "front": [ "国", "家"]
-}
 
-DPI = 200
-POINTS_PER_INCH = 72
-
-def px_to_pt(px, dpi=DPI):
-    """将像素值转换为点值(1点=1/72英寸)"""
-    return px * POINTS_PER_INCH / dpi
-
-def dynamic_extract_header(image, max_height=500, step=100, lang='chi_sim'):
-    """基于 OCR 文本逐字符扫描关键词集，优先返回最先出现的匹配章节"""
-    width, height = image.size
-    final_text = ""
-
-    for h in range(step, max_height + step, step):
-        crop_box = (0, 0, width, min(h, height))
-        region = image.crop(crop_box)
-        ocr_text = pytesseract.image_to_string(region, lang=lang).strip().replace("\n", "").replace(" ", "")
-        final_text = ocr_text
-
-        # 记录每个关键词在文本中的位置
-        keyword_hits = []
-
-        for section, keywords in HEADER_KEYWORDS.items():
-            for kw in keywords:
-                idx = ocr_text.find(kw)
-                if idx != -1:
-                    keyword_hits.append((idx, kw, section))
-
-        if not keyword_hits:
-            continue
-
-        # 按关键词首次出现位置排序
-        keyword_hits.sort(key=lambda x: x[0])  # idx 越小越优先
-
-        # 特别处理 description vs drawings 的冲突
-        first_hit_idx, first_kw, first_section = keyword_hits[0]
-        if first_section == "description":
-            # 再查一遍 OCR 文本中是否出现了 drawings 的关键词
-            has_drawings = any(kw in ocr_text for kw in HEADER_KEYWORDS["drawings"])
-            if has_drawings:
-                return "drawings", final_text
-            else:
-                return "description", final_text
-
-        # 否则直接返回第一个命中的章节
-        return first_section, final_text
-
-    return "unknown", final_text
-
-def split_pdf_by_dynamic_header(pdf_path, output_root="split_pdfs"):
-    """处理单个PDF并按照章节输出为独立PDF文件，不再裁剪页面"""
-    doc_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    output_dir = os.path.join(output_root, doc_name)
-    os.makedirs(output_dir, exist_ok=True)
-
-    log_path = os.path.join(output_dir, f"{doc_name}_ocr_log.txt")
-    log_file = open(log_path, "w", encoding="utf-8")
-    
-    pdf_document = fitz.open(pdf_path)
-    total_pages = len(pdf_document)
-    
-    section_ranges = defaultdict(list)
-    current_section = None
-    current_section_start = 0
-
-    for idx in range(total_pages):
-        page = pdf_document.load_page(idx)
-        pix = page.get_pixmap(dpi=DPI)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+class PatentPDFSplitter:
+    def __init__(self, use_gpu=False, match_algorithm='v3'):
+        """
+        初始化专利PDF分割器
         
-        section, ocr_text = dynamic_extract_header(img)
-
-        # 日志记录
-        log_entry = f"第 {idx + 1} 页 - 匹配章节: {section}\nOCR结果:\n{ocr_text}\n{'-' * 40}\n"
-        log_file.write(log_entry)
-
-        print(f"[{doc_name}] 第 {idx+1}/{total_pages} 页 → 匹配章节：{section}")
+        Args:
+            use_gpu: 是否使用GPU加速PaddleOCR
+            match_algorithm: 匹配算法版本 ('v2', 'v3')
+        """
+        # 初始化PaddleOCR
+        self.ocr = PaddleOCR(use_angle_cls=True, lang='ch', use_gpu=use_gpu)
         
-        if current_section is not None and section != current_section:
-            section_ranges[current_section].append((current_section_start, idx - 1))
-            current_section_start = idx
+        # 匹配算法版本
+        self.match_algorithm = match_algorithm
         
-        current_section = section
-
-    if current_section is not None:
-        section_ranges[current_section].append((current_section_start, total_pages - 1))
-
-    log_file.close()
-
-    for section, ranges in section_ranges.items():
-        section_dir = os.path.join(output_dir, section)
-        os.makedirs(section_dir, exist_ok=True)
+        # 定义各部分的页眉关键词（按优先级排序）
+        self.header_keywords = {
+            'drawings': ['附', '图', '附图', '说明书附图'],
+            'descriptions': ['说', '明', '说明书', '说明', '明书'],
+            'claims': ['要', '求', '要求', '权利', '权利要求', '权利要求书'],
+            'front': ['国', '家', '国家', '知识', '产权', '知识产权', '国家知识产权局']
+        }
         
-        for i, (start, end) in enumerate(ranges):
-            if start > end:
-                continue
-
-            new_pdf = fitz.open()
+        # 定义匹配优先级（避免混淆，优先匹配更具体的）
+        self.match_priority = ['drawings', 'claims', 'descriptions', 'front']
+        
+        # 页眉检测区域比例（页面顶部的比例）
+        self.header_region_ratio = 0.15
+        
+    def pdf_page_to_image(self, page) -> np.ndarray:
+        """
+        将PDF页面转换为图像
+        
+        Args:
+            page: PyMuPDF页面对象
             
-            for page_num in range(start, end + 1):
-                new_pdf.insert_pdf(pdf_document, from_page=page_num, to_page=page_num)
-
-            output_filename = f"pages_{start+1}-{end+1}.pdf"
-            if len(ranges) == 1:
-                output_filename = f"{section}.pdf"
-            elif i > 0:
-                output_filename = f"{section}_{i+1}.pdf"
-
-            output_path = os.path.join(section_dir, output_filename)
-            new_pdf.save(output_path)
-            new_pdf.close()
-            print(f"  已保存: {output_path}")
+        Returns:
+            numpy数组格式的图像
+        """
+        # 设置较高的分辨率以提高OCR准确性
+        mat = fitz.Matrix(2.0, 2.0)
+        pix = page.get_pixmap(matrix=mat)
+        img_data = pix.tobytes("png")
+        
+        # 转换为numpy数组
+        nparr = np.frombuffer(img_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        return img
     
-    pdf_document.close()
-    print(f"[完成] {doc_name} 输出至：{output_dir}")
+    def extract_header_region(self, img: np.ndarray) -> np.ndarray:
+        """
+        提取页面顶部的页眉区域
+        
+        Args:
+            img: 输入图像
+            
+        Returns:
+            页眉区域图像
+        """
+        height, width = img.shape[:2]
+        header_height = int(height * self.header_region_ratio)
+        
+        # 提取顶部区域作为页眉
+        header_img = img[0:header_height, :]
+        
+        return header_img
+    
+    def recognize_text(self, img: np.ndarray) -> List[str]:
+        """
+        使用PaddleOCR识别图像中的文本
+        
+        Args:
+            img: 输入图像
+            
+        Returns:
+            识别出的文本列表
+        """
+        try:
+            result = self.ocr.ocr(img, cls=True)
+            
+            texts = []
+            if result and result[0]:
+                for line in result[0]:
+                    if line and len(line) >= 2:
+                        text = line[1][0] if isinstance(line[1], (list, tuple)) else str(line[1])
+                        texts.append(text)
+            
+            return texts
+        except Exception as e:
+            print(f"OCR识别错误: {e}")
+            return []
+    
+    def find_best_match(self, text: str, keywords: List[str]) -> Tuple[bool, int, str]:
+        """
+        在文本中查找最佳匹配的关键词
+        
+        Args:
+            text: 待匹配的文本
+            keywords: 关键词列表
+            
+        Returns:
+            (是否匹配, 匹配位置, 匹配的关键词)
+        """
+        best_match = None
+        best_pos = len(text)
+        best_keyword = ""
+        
+        for keyword in keywords:
+            pos = text.find(keyword)
+            if pos != -1 and pos < best_pos:
+                best_match = True
+                best_pos = pos
+                best_keyword = keyword
+        
+        return (best_match is not None, best_pos, best_keyword)
+    
+    def classify_page_type_v2(self, texts: List[str]) -> str:
+        """
+        改进版页面类型分类，使用位置匹配算法
+        
+        Args:
+            texts: 识别出的文本列表
+            
+        Returns:
+            页面类型 ('front', 'claims', 'descriptions', 'drawings', 'unknown')
+        """
+        # 将所有文本合并，去除空格和标点符号
+        combined_text = ''.join(texts).replace(' ', '').replace('　', '')
+        
+        print(f"  合并文本: '{combined_text}'")
+        
+        # 按优先级匹配，避免混淆
+        match_results = {}
+        
+        for page_type in self.match_priority:
+            keywords = self.header_keywords[page_type]
+            is_match, pos, matched_keyword = self.find_best_match(combined_text, keywords)
+            
+            if is_match:
+                match_results[page_type] = {
+                    'position': pos,
+                    'keyword': matched_keyword,
+                    'score': len(matched_keyword)  # 长度作为匹配强度
+                }
+                print(f"    {page_type}: 匹配到 '{matched_keyword}' 位置 {pos}")
+        
+        if not match_results:
+            print(f"    未匹配到任何关键词")
+            return 'unknown'
+        
+        # 特殊处理：如果同时匹配到"说明书"相关和"附图"相关，优先选择"附图"
+        if 'drawings' in match_results and 'descriptions' in match_results:
+            drawings_pos = match_results['drawings']['position']
+            desc_pos = match_results['descriptions']['position']
+            
+            # 如果"附图"相关词汇出现在"说明书"相关词汇之后，且距离较近，判断为附图
+            if abs(drawings_pos - desc_pos) <= 10:  # 距离阈值
+                print(f"    检测到'说明书附图'组合，分类为 drawings")
+                return 'drawings'
+        
+        # 选择位置最靠前且匹配强度最高的
+        best_match = min(match_results.items(), 
+                        key=lambda x: (x[1]['position'], -x[1]['score']))
+        
+        result_type = best_match[0]
+        print(f"    最终分类: {result_type} (关键词: '{best_match[1]['keyword']}')")
+        
+        return result_type
 
-def batch_process_all_pdfs(input_dir="pdf_files", output_root="split_pdfs"):
-    """批量处理整个文件夹中的PDF"""
-    for file in os.listdir(input_dir):
-        if file.lower().endswith(".pdf"):
-            pdf_path = os.path.join(input_dir, file)
-            print(f"\n=== 正在处理：{file} ===")
-            split_pdf_by_dynamic_header(pdf_path, output_root)
+    def char_level_match(self, text: str, keywords: List[str]) -> Tuple[bool, float, str]:
+        """
+        字符级别的模糊匹配，处理OCR识别不完整的情况
+        
+        Args:
+            text: 待匹配的文本
+            keywords: 关键词列表
+            
+        Returns:
+            (是否匹配, 匹配得分, 最佳匹配关键词)
+        """
+        best_score = 0
+        best_keyword = ""
+        
+        for keyword in keywords:
+            # 计算字符匹配度
+            if len(keyword) == 1:
+                # 单字符匹配
+                if keyword in text:
+                    score = 1.0
+                else:
+                    score = 0
+            else:
+                # 多字符匹配，计算包含的字符比例
+                matched_chars = sum(1 for char in keyword if char in text)
+                score = matched_chars / len(keyword)
+                
+                # 如果是完全匹配，给予额外加分
+                if keyword in text:
+                    score += 0.5
+                    
+                # 如果字符是连续出现的，给予额外加分
+                for i in range(len(text) - len(keyword) + 1):
+                    substring = text[i:i+len(keyword)]
+                    if substring == keyword:
+                        score += 1.0
+                        break
+                    # 检查部分连续匹配
+                    partial_match = 0
+                    for j, char in enumerate(keyword):
+                        if j < len(substring) and substring[j] == char:
+                            partial_match += 1
+                        else:
+                            break
+                    if partial_match > len(keyword) * 0.6:  # 60%以上连续匹配
+                        score += partial_match / len(keyword) * 0.3
+            
+            if score > best_score:
+                best_score = score
+                best_keyword = keyword
+        
+        # 设置匹配阈值
+        threshold = 0.3 if len(best_keyword) > 1 else 1.0
+        is_match = best_score >= threshold
+        
+        return (is_match, best_score, best_keyword)
+    
+    def classify_page_type_v3(self, texts: List[str]) -> str:
+        """
+        使用字符级匹配的页面分类方法
+        
+        Args:
+            texts: 识别出的文本列表
+            
+        Returns:
+            页面类型
+        """
+        # 将所有文本合并，去除空格和标点符号
+        combined_text = ''.join(texts).replace(' ', '').replace('　', '').replace(',', '').replace('，', '')
+        
+        print(f"  合并文本: '{combined_text}'")
+        
+        # 对每个类型进行字符级匹配
+        type_scores = {}
+        
+        for page_type in self.match_priority:
+            keywords = self.header_keywords[page_type]
+            is_match, score, matched_keyword = self.char_level_match(combined_text, keywords)
+            
+            if is_match:
+                type_scores[page_type] = {
+                    'score': score,
+                    'keyword': matched_keyword
+                }
+                print(f"    {page_type}: 匹配 '{matched_keyword}' 得分 {score:.2f}")
+        
+        if not type_scores:
+            print(f"    未匹配到任何关键词")
+            return 'unknown'
+        
+        # 特殊处理逻辑：处理"说明书附图"和"说明书"的混淆
+        if 'drawings' in type_scores and 'descriptions' in type_scores:
+            drawings_score = type_scores['drawings']['score']
+            desc_score = type_scores['descriptions']['score']
+            
+            # 检查是否包含"附图"的特征字符
+            has_attachment_chars = any(char in combined_text for char in ['附', '图'])
+            
+            if has_attachment_chars and drawings_score >= desc_score * 0.7:
+                print(f"    检测到附图特征，优先选择 drawings")
+                return 'drawings'
+        
+        # 选择得分最高的类型
+        best_type = max(type_scores.items(), key=lambda x: x[1]['score'])
+        result_type = best_type[0]
+        
+        print(f"    最终分类: {result_type} (关键词: '{best_type[1]['keyword']}', 得分: {best_type[1]['score']:.2f})")
+        
+        return result_type
+    
+    def analyze_pdf_structure(self, pdf_path: str) -> Dict[str, List[int]]:
+        """
+        分析PDF结构，确定各部分的页面范围
+        
+        Args:
+            pdf_path: PDF文件路径
+            
+        Returns:
+            各部分对应的页面列表字典
+        """
+        doc = fitz.open(pdf_path)
+        page_types = []
+        
+        print(f"开始分析PDF结构，总页数: {len(doc)}")
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            
+            # 转换页面为图像
+            img = self.pdf_page_to_image(page)
+            
+            # 提取页眉区域
+            header_img = self.extract_header_region(img)
+            
+            # 识别页眉文本
+            texts = self.recognize_text(header_img)
+            
+            # 分类页面类型 - 根据选择的算法版本
+            if self.match_algorithm == 'v3':
+                page_type = self.classify_page_type_v3(texts)
+            else:
+                page_type = self.classify_page_type_v2(texts)
+            page_types.append(page_type)
+            
+            print(f"页面 {page_num + 1}: 识别文本 {texts} -> 类型: {page_type}")
+        
+        doc.close()
+        
+        # 组织各部分的页面范围
+        sections = {'front': [], 'claims': [], 'descriptions': [], 'drawings': []}
+        
+        for i, page_type in enumerate(page_types):
+            if page_type != 'unknown':
+                sections[page_type].append(i)
+        
+        # 处理未识别的页面，根据上下文推断
+        for i, page_type in enumerate(page_types):
+            if page_type == 'unknown':
+                # 查找前后已识别的页面类型
+                prev_type = None
+                next_type = None
+                
+                for j in range(i-1, -1, -1):
+                    if page_types[j] != 'unknown':
+                        prev_type = page_types[j]
+                        break
+                
+                for j in range(i+1, len(page_types)):
+                    if page_types[j] != 'unknown':
+                        next_type = page_types[j]
+                        break
+                
+                # 根据上下文推断类型
+                if prev_type and not next_type:
+                    # 如果只有前面的类型，继续使用前面的类型
+                    inferred_type = prev_type
+                elif prev_type == next_type:
+                    # 如果前后类型相同，使用该类型
+                    inferred_type = prev_type
+                elif prev_type:
+                    # 如果有前面的类型，使用前面的类型
+                    inferred_type = prev_type
+                else:
+                    # 默认归类为首页
+                    inferred_type = 'front'
+                
+                sections[inferred_type].append(i)
+                print(f"页面 {i + 1}: 未识别类型，推断为 {inferred_type}")
+        
+        return sections
+    
+    def split_pdf(self, input_path: str, output_dir: str):
+        """
+        分割PDF文件
+        
+        Args:
+            input_path: 输入PDF文件路径
+            output_dir: 输出目录
+        """
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # 分析PDF结构
+        sections = self.analyze_pdf_structure(input_path)
+        
+        # 打开原始PDF
+        doc = fitz.open(input_path)
+        
+        # 生成各部分PDF
+        section_names = {
+            'front': 'front.pdf',
+            'claims': 'claims.pdf', 
+            'descriptions': 'descriptions.pdf',
+            'drawings': 'drawings.pdf'
+        }
+        
+        for section_type, pages in sections.items():
+            if pages:  # 如果该部分有页面
+                # 创建新的PDF文档
+                new_doc = fitz.open()
+                
+                # 按页面顺序排序
+                pages.sort()
+                
+                # 复制页面到新文档
+                for page_num in pages:
+                    new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                
+                # 保存分割后的PDF
+                output_path = os.path.join(output_dir, section_names[section_type])
+                new_doc.save(output_path)
+                new_doc.close()
+                
+                print(f"已生成 {section_type} 部分: {output_path} (页面: {[p+1 for p in pages]})")
+            else:
+                print(f"未找到 {section_type} 部分的页面")
+        
+        doc.close()
+        print("PDF分割完成！")
 
-# === 主入口 ===
+
+def main():
+    parser = argparse.ArgumentParser(description='专利PDF文件分割工具')
+    parser.add_argument('input_pdf', help='输入的专利PDF文件路径')
+    parser.add_argument('-o', '--output', default='./output', help='输出目录 (默认: ./output)')
+    parser.add_argument('--gpu', action='store_true', help='使用GPU加速PaddleOCR')
+    parser.add_argument('--match-algorithm', choices=['v2', 'v3'], default='v3',
+                       help='选择匹配算法: v2=位置匹配, v3=字符级匹配 (默认: v3)')
+    parser.add_argument('--header-ratio', type=float, default=0.15, 
+                       help='页眉区域占页面的比例 (默认: 0.15)')
+    
+    args = parser.parse_args()
+    
+    # 检查输入文件是否存在
+    if not os.path.exists(args.input_pdf):
+        print(f"错误: 输入文件 {args.input_pdf} 不存在")
+        return
+    
+    # 创建分割器
+    splitter = PatentPDFSplitter(use_gpu=args.gpu, match_algorithm=args.match_algorithm)
+    
+    # 设置页眉区域比例
+    if args.header_ratio:
+        splitter.header_region_ratio = args.header_ratio
+    
+    # 执行分割
+    try:
+        splitter.split_pdf(args.input_pdf, args.output)
+    except Exception as e:
+        print(f"分割过程中出现错误: {e}")
+
+
 if __name__ == "__main__":
-    batch_process_all_pdfs(
-        input_dir=r"/workspace/pdf_files/test",
-        output_root=r"/workspace/split_pdfs"
-    )
+    main()
