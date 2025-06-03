@@ -1,11 +1,4 @@
-<<<<<<< HEAD
 libstdc++.so
 libstdc++.so.6
 pdf_files/
 __pycache__/
-=======
-requirements.txt
-re_cuda.txt
-train/
-split_pdfs/
->>>>>>> 38bed604146978c80a320ab4dd64d6702ed354af
