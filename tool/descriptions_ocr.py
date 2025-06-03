@@ -479,7 +479,7 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
     text_output = process_text_with_paragraphs(all_text_lines, debug=debug)
     
     # 写入文本文件
-    text_file = os.path.join(output_dir, "text.txt")
+    text_file = os.path.join(output_dir, "description.txt")
     with open(text_file, "w", encoding="utf-8") as f:
         f.write("\n\n".join(text_output))  # 段落间用双换行分隔
     
