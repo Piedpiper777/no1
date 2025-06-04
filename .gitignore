@@ -1,4 +1,5 @@
-libstdc++.so
-libstdc++.so.6
+tool/libstdc++.so
+tool/libstdc++.so.6
 pdf_files/
-__pycache__/
+tool/__pycache__/
+tool/output/
