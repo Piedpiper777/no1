@@ -1,5 +1,6 @@
-tool/libstdc++.so
-tool/libstdc++.so.6
-pdf_files/
-tool/__pycache__/
-tool/output/
+libstdc++.so
+libstdc++.so.6
+__pycache__/
+output/
+documents/
+model/

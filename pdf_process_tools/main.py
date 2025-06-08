@@ -107,6 +107,6 @@ def main(pdf_path, output_dir):
     print(f"处理完成，结果保存到: {output_dir}")
 
 if __name__ == "__main__":
-    input_pdf_path = r"/workspace/project/pdf_files/CN111964678B.pdf"  # 替换为你的路径
+    input_pdf_path = r"/workspace/project/documents/CN212384434U.pdf"  # 替换为你的路径
     output_dir = "output"
     main(input_pdf_path, output_dir)
