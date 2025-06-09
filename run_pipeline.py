@@ -38,14 +38,14 @@ def run_pipeline():
         # Step 4: 打印结果
         print("🎯 问题:", question)
         for idx, option in enumerate(item["options"]):
-            print(f"  {chr(65 + idx)}. {option}")
+            print(f"{option}")
         print("✅ 正确答案:", item["answer"])
         print("🔍 检索结果:")
         for r in retrieved:
             print("   -", r)
 
         # Step 5: 清理 output
-        shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+        #shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
 
 if __name__ == "__main__":
     run_pipeline()

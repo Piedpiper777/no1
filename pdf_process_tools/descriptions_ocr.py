@@ -70,6 +70,59 @@ def detect_pdf_type(pdf_path, sample_pages=3):
     
     return pdf_type
 
+def detect_content_area(page, margin_ratio=0.05):
+    """
+    动态检测页面内容区域，自适应裁剪
+    
+    Args:
+        page: pdfplumber页面对象
+        margin_ratio: 边距比例（默认5%）
+    
+    Returns:
+        tuple: (x0, y0, x1, y1) 内容区域坐标
+    """
+    width, height = page.width, page.height
+    
+    # 默认边距
+    default_margin_x = width * margin_ratio
+    default_margin_y = height * margin_ratio
+    
+    # 尝试检测文本分布来确定内容区域
+    try:
+        # 获取页面上所有文本对象
+        chars = page.chars
+        if chars:
+            # 计算文本的边界
+            x_coords = [char['x0'] for char in chars] + [char['x1'] for char in chars]
+            y_coords = [char['top'] for char in chars] + [char['bottom'] for char in chars]
+            
+            if x_coords and y_coords:
+                text_left = min(x_coords)
+                text_right = max(x_coords)
+                text_top = min(y_coords)
+                text_bottom = max(y_coords)
+                
+                # 在文本边界基础上适当扩展
+                expand_x = width * 0.02  # 2%扩展
+                expand_y = height * 0.02
+                
+                content_x0 = max(0, text_left - expand_x)
+                content_y0 = max(0, text_top - expand_y)
+                content_x1 = min(width, text_right + expand_x)
+                content_y1 = min(height, text_bottom + expand_y)
+                
+                return (content_x0, content_y0, content_x1, content_y1)
+    except:
+        pass
+    
+    # 如果检测失败，使用默认边距
+    return (
+        default_margin_x,
+        default_margin_y,
+        width - default_margin_x,
+        height - default_margin_y
+    )
+
 def fix_chinese_soft_breaks(s):
     """修复中文换行导致的拆词问题"""
     s = re.sub(r'-\s+', '', s)
@@ -221,9 +274,16 @@ def extract_images_tables_with_ppstructure(pdf_path, page_num, current_id, img_c
     
     return img_counter, table_counter, para_buffer
 
-def extract_text_pdf(pdf_path, output_dir):
-    """处理文本型PDF - 使用原始逻辑 + PPStructure增强"""
-    print("📄 使用文本型PDF处理模式...")
+def extract_text_pdf_fixed(pdf_path, output_dir):
+    """
+    修复版文本型PDF处理器 - 解决文本丢失问题
+    
+    主要修复：
+    1. 不依赖特定编号格式，保存所有文本
+    2. 动态检测内容区域
+    3. 改进段落分割逻辑
+    """
+    print("📄 使用修复版文本型PDF处理模式...")
     
     os.makedirs(output_dir, exist_ok=True)
     img_dir = os.path.join(output_dir, "images")
@@ -232,51 +292,143 @@ def extract_text_pdf(pdf_path, output_dir):
     text_output = []
     img_counter = 0
     table_counter = 0
-    para_buffer = ""
-    current_id = None
+    all_text_lines = []  # 收集所有文本行
     
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages):
-            width, height = page.width, page.height
-            crop = page.within_bbox((0, height * 0.07, width, height * 0.9))
+            print(f"处理第 {page_num + 1}/{len(pdf.pages)} 页")
+            
+            # 动态检测内容区域
+            content_area = detect_content_area(page)
+            crop = page.within_bbox(content_area)
             text = crop.extract_text()
             
             if not text:
+                print(f"  ⚠️ 第{page_num+1}页未提取到文本")
                 continue
             
-            # 原有的文本处理逻辑
-            lines = text.split('\n')
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                match = re.match(r'\[(\d{4})\]', line)
-                if match:
-                    if current_id is not None:
-                        cleaned_para = fix_chinese_soft_breaks(para_buffer.strip())
-                        text_output.append(cleaned_para)
-                    current_id = match.group(1)
-                    para_buffer = line[len(match.group(0)):].strip()
-                else:
-                    para_buffer += ' ' + line.strip()
+            # 按行分割并清理
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            all_text_lines.extend(lines)
+            with open(os.path.join(output_dir, "raw_lines.txt"), "w", encoding="utf-8") as f:
+                for i, line in enumerate(all_text_lines):
+                    f.write(f"{i+1:04d}: {repr(line)}\n")
+
+            
+            print(f"  📝 提取了 {len(lines)} 行文本")
             
             # PPStructure增强图片表格提取
             try:
-                img_counter, table_counter, para_buffer = extract_images_tables_with_ppstructure(
-                    pdf_path, page_num, current_id, img_counter, table_counter, img_dir, para_buffer
+                # 为了兼容原有逻辑，这里需要一个临时的para_buffer
+                temp_para_buffer = ""
+                img_counter, table_counter, _ = extract_images_tables_with_ppstructure(
+                    pdf_path, page_num, None, img_counter, table_counter, img_dir, temp_para_buffer
                 )
             except Exception as e:
                 print(f"⚠️ 页面{page_num+1}的PPStructure处理失败: {str(e)}")
     
-    if current_id and para_buffer.strip():
-        cleaned_para = fix_chinese_soft_breaks(para_buffer.strip())
-        text_output.append(cleaned_para)
+    # 智能处理文本段落
+    print(f"🔄 处理提取的文本，共 {len(all_text_lines)} 行")
     
-    with open(os.path.join(output_dir, "text.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(text_output))
+    # 改进的段落分割逻辑
+    text_output = smart_paragraph_split(all_text_lines)
+    
+    # 保存文本
+    text_file = os.path.join(output_dir, "text.txt")
+    with open(text_file, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(text_output))  # 段落间用双换行分隔
+    
+    print(f"✅ 文本提取完成，共 {len(text_output)} 个段落")
     
     return len(text_output), img_counter, table_counter
+
+import re
+
+def smart_paragraph_split(text_lines):
+    paragraphs = []
+    current_paragraph = []
+
+    # 常见编号格式
+    number_patterns = [
+        r'^\d+[\.\．]',                    # 1. 2. 3.
+        r'^[\[\(（\（]+\d+[\]\)）\）]+',    # [1] (1) （1）
+        r'^\d+[\)）]',                    # 1) 2)
+    ]
+
+    # 结构性标题关键词
+    SECTION_TITLES = {
+        "技术领域": ["技术领域"],
+        "背景技术": ["背景技术"],
+        "发明内容": ["发明内容", "实用新型内容"],
+        "附图说明": ["附图说明"],
+        "具体实施方式": ["具体实施方式"]
+    }
+
+    def is_numbered_line(line):
+        for pattern in number_patterns:
+            if re.match(pattern, line):
+                return True
+        return False
+
+    def is_title_like(line):
+        return len(line) < 50 and (line.isupper() or line.endswith('：') or line.endswith(':'))
+
+    def is_section_title(line):
+        stripped = line.strip().replace(" ", "")
+        for section, aliases in SECTION_TITLES.items():
+            for alias in aliases:
+                if stripped == alias:
+                    return section
+        return None
+
+    def fix_chinese_soft_breaks(s):
+        s = re.sub(r'-\s+', '', s)
+        s = re.sub(r'(?<=[\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])', '', s)
+        return s
+
+    for i, line in enumerate(text_lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        section = is_section_title(line)
+        if section:
+            # 保存当前段落
+            if current_paragraph:
+                paragraph_text = fix_chinese_soft_breaks(" ".join(current_paragraph))
+                if paragraph_text.strip():
+                    paragraphs.append(paragraph_text)
+                current_paragraph = []
+
+            # 小标题独立成段
+            paragraphs.append(section)
+            continue
+
+        is_new_paragraph = False
+        if is_numbered_line(line):
+            is_new_paragraph = True
+        elif is_title_like(line):
+            is_new_paragraph = True
+        elif i > 0 and len(line) < 20 and not line.endswith(('，', '。', '；', '：', ',', '.', ';', ':')):
+            is_new_paragraph = True
+
+        if is_new_paragraph and current_paragraph:
+            paragraph_text = fix_chinese_soft_breaks(" ".join(current_paragraph))
+            if paragraph_text.strip():
+                paragraphs.append(paragraph_text)
+            current_paragraph = []
+
+        current_paragraph.append(line)
+
+    if current_paragraph:
+        paragraph_text = fix_chinese_soft_breaks(" ".join(current_paragraph))
+        if paragraph_text.strip():
+            paragraphs.append(paragraph_text)
+
+    # 过滤过短的段落（可能是噪声）
+    filtered_paragraphs = [p for p in paragraphs if len(p.strip()) > 1]
+
+    return filtered_paragraphs
 
 def extract_image_pdf(pdf_path, output_dir, debug=False):
     """
@@ -285,7 +437,7 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
     Args:
         pdf_path: PDF文件路径
         output_dir: 输出目录
-        debug: 是否输出调试信息和中间结果
+        debug: 是否输出调试信息和中间文件
     """
     
     print(f"🖼️ 使用增强版图片型PDF处理模式: {os.path.basename(pdf_path)}")
@@ -475,8 +627,8 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
         if len(all_text_lines) > 10:
             print(f"  ... 还有 {len(all_text_lines)-10} 行")
     
-    # 处理文本并识别段落
-    text_output = process_text_with_paragraphs(all_text_lines, debug=debug)
+    # 使用改进的段落分割逻辑
+    text_output = smart_paragraph_split(all_text_lines)
     
     # 写入文本文件
     text_file = os.path.join(output_dir, "description.txt")
@@ -503,13 +655,13 @@ def smart_extract_pdf(pdf_path, output_dir, debug=False):
     
     # 第二步：选择对应的处理方法
     if pdf_type == 'text':
-        paragraphs, images, tables = extract_text_pdf(pdf_path, output_dir)
+        paragraphs, images, tables = extract_text_pdf_fixed(pdf_path, output_dir)  # 使用修复版
     elif pdf_type == 'image':
         paragraphs, images, tables = extract_image_pdf(pdf_path, output_dir, debug=debug)
     else:  # mixed
-        print("📄🖼️ 混合型PDF，使用文本模式处理（主要逻辑）+ OCR补充")
-        # 混合型暂时使用文本模式，后续可以优化为逐页判断
-        paragraphs, images, tables = extract_text_pdf(pdf_path, output_dir)
+        print("📄🖼️ 混合型PDF，使用修复版文本模式处理（主要逻辑）+ OCR补充")
+        # 混合型使用修复版文本模式，后续可以优化为逐页判断
+        paragraphs, images, tables = extract_text_pdf_fixed(pdf_path, output_dir)
     
     print(f"\n✅ 处理完成！")
     print(f"   📊 PDF类型: {pdf_type}")
@@ -527,8 +679,8 @@ def smart_extract_pdf(pdf_path, output_dir, debug=False):
 
 # 用法示例
 if __name__ == "__main__":
-    pdf_path = r"/workspace/project/split_pdfs/CN111964678B/description/description.pdf"
-    output_dir = "output_smart_integrated"
+    pdf_path = r"/workspace/project/output/descriptions.pdf"
+    output_dir = "output_descriptions"
     
     try:
         # 开启调试模式以获得更详细的输出和中间文件
