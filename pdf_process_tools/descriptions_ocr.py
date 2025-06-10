@@ -72,11 +72,11 @@ def detect_pdf_type(pdf_path, sample_pages=3):
 
 def detect_content_area(page, margin_ratio=0.05):
     """
-    动态检测页面内容区域，自适应裁剪
+    改进版动态检测页面内容区域,自动过滤页眉页脚和页码
     
     Args:
         page: pdfplumber页面对象
-        margin_ratio: 边距比例（默认5%）
+        margin_ratio: 基础边距比例（默认5%）
     
     Returns:
         tuple: (x0, y0, x1, y1) 内容区域坐标
@@ -87,41 +87,108 @@ def detect_content_area(page, margin_ratio=0.05):
     default_margin_x = width * margin_ratio
     default_margin_y = height * margin_ratio
     
-    # 尝试检测文本分布来确定内容区域
     try:
         # 获取页面上所有文本对象
         chars = page.chars
-        if chars:
-            # 计算文本的边界
-            x_coords = [char['x0'] for char in chars] + [char['x1'] for char in chars]
-            y_coords = [char['top'] for char in chars] + [char['bottom'] for char in chars]
+        
+        if not chars:
+            return (
+                default_margin_x,
+                default_margin_y,
+                width - default_margin_x,
+                height - default_margin_y
+            )
             
-            if x_coords and y_coords:
-                text_left = min(x_coords)
-                text_right = max(x_coords)
-                text_top = min(y_coords)
-                text_bottom = max(y_coords)
+        # 按y坐标分组统计字符分布
+        y_groups = {}
+        for char in chars:
+            y = int(char['top'])
+            if y not in y_groups:
+                y_groups[y] = []
+            y_groups[y].append(char)
+        
+        # 页码检测特征
+        def is_page_number(char_group):
+            # 1. 长度特征：页码通常很短
+            if len(char_group) > 5:
+                return False
                 
-                # 在文本边界基础上适当扩展
-                expand_x = width * 0.02  # 2%扩展
-                expand_y = height * 0.02
+            # 2. 数字特征：页码通常是纯数字
+            text = ''.join(char['text'] for char in char_group)
+            if not text.isdigit():
+                return False
                 
-                content_x0 = max(0, text_left - expand_x)
-                content_y0 = max(0, text_top - expand_y)
-                content_x1 = min(width, text_right + expand_x)
-                content_y1 = min(height, text_bottom + expand_y)
+            # 3. 位置特征：通常在页面底部居中
+            avg_x = sum(char['x0'] for char in char_group) / len(char_group)
+            center_zone = (width * 0.4, width * 0.6)  # 中间区域
+            if not (center_zone[0] < avg_x < center_zone[1]):
+                return False
                 
-                return (content_x0, content_y0, content_x1, content_y1)
-    except:
-        pass
-    
-    # 如果检测失败，使用默认边距
-    return (
-        default_margin_x,
-        default_margin_y,
-        width - default_margin_x,
-        height - default_margin_y
-    )
+            return True
+
+        # 分析垂直方向的文本密度
+        density_threshold = len(chars) / height * 0.3  # 动态密度阈值
+        
+        # 找出页眉页脚的边界
+        header_bottom = 0
+        footer_top = height
+        
+        sorted_y = sorted(y_groups.keys())
+        last_valid_text_y = 0  # 记录最后一个有效文本的位置
+        
+        # 检测页眉
+        for y in sorted_y:
+            if len(y_groups[y]) < density_threshold and not is_page_number(y_groups[y]):
+                header_bottom = y
+            else:
+                break
+
+        # 检测页脚(自下而上)
+        for y in reversed(sorted_y):
+            # 如果是页码，跳过这一行
+            if is_page_number(y_groups[y]):
+                continue
+                
+            if len(y_groups[y]) < density_threshold:
+                footer_top = y
+            else:
+                last_valid_text_y = y
+                break
+        
+        # 获取水平方向边界
+        x_coords = [char['x0'] for char in chars] + [char['x1'] for char in chars]
+        text_left = max(min(x_coords), default_margin_x)
+        text_right = min(max(x_coords), width - default_margin_x)
+        
+        # 添加安全边距
+        safe_margin = min(width, height) * 0.02
+        content_x0 = max(0, text_left - safe_margin)
+        content_y0 = max(header_bottom + safe_margin, default_margin_y)
+        content_x1 = min(width, text_right + safe_margin)
+        
+        # 使用最后一个有效文本位置来设置底部边界
+        if last_valid_text_y:
+            content_y1 = min(last_valid_text_y + safe_margin, height - default_margin_y)
+        else:
+            content_y1 = min(footer_top - safe_margin, height - default_margin_y)
+        
+        # 确保坐标有效
+        content_x0 = max(0, content_x0)
+        content_y0 = max(0, content_y0)
+        content_x1 = min(width, content_x1)
+        content_y1 = min(height, content_y1)
+        
+        return (content_x0, content_y0, content_x1, content_y1)
+        
+    except Exception as e:
+        print(f"⚠️ 内容区域检测失败: {str(e)}")
+        # 如果分析失败,使用默认边距
+        return (
+            default_margin_x,
+            default_margin_y,
+            width - default_margin_x,
+            height - default_margin_y
+        )
 
 def fix_chinese_soft_breaks(s):
     """修复中文换行导致的拆词问题"""
@@ -155,7 +222,7 @@ def preprocess_image(img):
     
     return processed_img
 
-def process_text_with_paragraphs(text_lines, debug=False):
+def process_text_with_paragraphs(text_lines):
     """修改版：仅处理带括号的编号"""
     text_output = []
     current_para = []
@@ -186,8 +253,7 @@ def process_text_with_paragraphs(text_lines, debug=False):
     )
 
     for line in merged_lines:
-        if debug:
-            print(f"处理合并行: {line[:60]}...")
+        
 
         # 仅匹配带括号的编号
         match = para_pattern.match(line)
@@ -274,16 +340,15 @@ def extract_images_tables_with_ppstructure(pdf_path, page_num, current_id, img_c
     
     return img_counter, table_counter, para_buffer
 
-def extract_text_pdf_fixed(pdf_path, output_dir):
+def extract_text_pdf(pdf_path, output_dir):
     """
-    修复版文本型PDF处理器 - 解决文本丢失问题
+    文本型PDF处理器
     
-    主要修复：
-    1. 不依赖特定编号格式，保存所有文本
-    2. 动态检测内容区域
-    3. 改进段落分割逻辑
+    Args:
+        pdf_path: PDF文件路径
+        output_dir: 输出目录
     """
-    print("📄 使用修复版文本型PDF处理模式...")
+    print("📄 使用文本型PDF处理模式...")
     
     os.makedirs(output_dir, exist_ok=True)
     img_dir = os.path.join(output_dir, "images")
@@ -310,16 +375,11 @@ def extract_text_pdf_fixed(pdf_path, output_dir):
             # 按行分割并清理
             lines = [line.strip() for line in text.split('\n') if line.strip()]
             all_text_lines.extend(lines)
-            with open(os.path.join(output_dir, "raw_lines.txt"), "w", encoding="utf-8") as f:
-                for i, line in enumerate(all_text_lines):
-                    f.write(f"{i+1:04d}: {repr(line)}\n")
-
             
             print(f"  📝 提取了 {len(lines)} 行文本")
             
             # PPStructure增强图片表格提取
             try:
-                # 为了兼容原有逻辑，这里需要一个临时的para_buffer
                 temp_para_buffer = ""
                 img_counter, table_counter, _ = extract_images_tables_with_ppstructure(
                     pdf_path, page_num, None, img_counter, table_counter, img_dir, temp_para_buffer
@@ -330,16 +390,23 @@ def extract_text_pdf_fixed(pdf_path, output_dir):
     # 智能处理文本段落
     print(f"🔄 处理提取的文本，共 {len(all_text_lines)} 行")
     
-    # 改进的段落分割逻辑
+    # 使用改进的段落分割逻辑
     text_output = smart_paragraph_split(all_text_lines)
     
-    # 保存文本
-    text_file = os.path.join(output_dir, "text.txt")
+    # 保存文本文件
+    text_file = os.path.join(output_dir, "descriptions.txt")
     with open(text_file, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(text_output))  # 段落间用双换行分隔
+        f.write("\n\n".join(text_output))
+    
+    # 生成JSON文件
+    json_file = os.path.join(output_dir, "descriptions.json")
+    try:
+        convert_text_to_json(text_file, json_file)
+        print(f"✅ JSON文件已生成: {json_file}")
+    except Exception as e:
+        print(f"⚠️ JSON转换失败: {str(e)}")
     
     print(f"✅ 文本提取完成，共 {len(text_output)} 个段落")
-    
     return len(text_output), img_counter, table_counter
 
 import re
@@ -430,26 +497,20 @@ def smart_paragraph_split(text_lines):
 
     return filtered_paragraphs
 
-def extract_image_pdf(pdf_path, output_dir, debug=False):
+def extract_image_pdf(pdf_path, output_dir):
     """
-    增强版图片型PDF处理器 - 集成自script2
+    图片型PDF处理器
     
     Args:
         pdf_path: PDF文件路径
         output_dir: 输出目录
-        debug: 是否输出调试信息和中间文件
     """
-    
-    print(f"🖼️ 使用增强版图片型PDF处理模式: {os.path.basename(pdf_path)}")
+    print(f"🖼️ 使用图片型PDF处理模式: {os.path.basename(pdf_path)}")
     
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
     img_dir = os.path.join(output_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
-    
-    if debug:
-        debug_dir = os.path.join(output_dir, "debug")
-        os.makedirs(debug_dir, exist_ok=True)
     
     # 初始化OCR引擎
     print("🔧 初始化OCR引擎...")
@@ -492,18 +553,8 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
         nparr = np.frombuffer(img_data, np.uint8)
         original_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        if debug:
-            debug_img_path = os.path.join(debug_dir, f"page_{page_num+1}_original.png")
-            cv2.imwrite(debug_img_path, original_img)
-            print(f"🔍 原始图片已保存: {debug_img_path}")
-        
         # 图片预处理
         processed_img = preprocess_image(original_img)
-        
-        if debug:
-            debug_processed_path = os.path.join(debug_dir, f"page_{page_num+1}_processed.png")
-            cv2.imwrite(debug_processed_path, processed_img)
-            print(f"🔍 预处理图片已保存: {debug_processed_path}")
         
         page_text_lines = []
         structure_success = False
@@ -520,9 +571,6 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
                 for item in structure_result:
                     bbox = item['bbox']
                     item_type = item['type']
-                    
-                    if debug:
-                        print(f"  发现{item_type}: {bbox}")
                     
                     if item_type == 'text':
                         # 处理文本区域
@@ -552,8 +600,6 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
                             img_name = f"page{page_num+1}_img{img_counter}.png"
                             img_path = os.path.join(img_dir, img_name)
                             cv2.imwrite(img_path, cropped_img)
-                            
-                            # 在文本中插入图片标记
                             page_text_lines.append(f"[IMG_{img_counter}]")
                             print(f"  📷 提取图片: {img_name}")
                     
@@ -571,8 +617,6 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
                             table_name = f"page{page_num+1}_table{table_counter}.png"
                             table_path = os.path.join(img_dir, table_name)
                             cv2.imwrite(table_path, cropped_table)
-                            
-                            # 在文本中插入表格标记
                             page_text_lines.append(f"[TABLE_{table_counter}]")
                             print(f"  📊 提取表格: {table_name}")
         
@@ -583,7 +627,20 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
         if not structure_success:
             print("🔤 使用纯OCR模式...")
             try:
-                # 使用预处理后的图片进行OCR
+                # 在OCR之前添加内容区域检测和裁剪
+                page = pdf_document[page_num]
+                content_area = detect_content_area(page)
+                x0, y0, x1, y1 = [int(coord) for coord in content_area]
+
+                # 裁剪图片到内容区域
+                h, w = original_img.shape[:2]
+                content_img = original_img[
+                    int(y0 * h / page.height):int(y1 * h / page.height),
+                    int(x0 * w / page.width):int(x1 * w / page.width)
+                ]
+
+                # 对裁剪后的图片进行OCR处理
+                processed_img = preprocess_image(content_img)
                 ocr_result = ocr_engine.ocr(processed_img, cls=True)
                 
                 if ocr_result and ocr_result[0]:
@@ -597,55 +654,116 @@ def extract_image_pdf(pdf_path, output_dir, debug=False):
                         # 置信度过滤
                         if confidence > 0.6:
                             page_text_lines.append(text)
-                            if debug:
-                                print(f"  OCR: {text} (置信度: {confidence:.2f})")
-                else:
-                    print("  ⚠️ OCR返回空结果")
             
             except Exception as e:
                 print(f"❌ OCR处理失败: {str(e)}")
         
-        # 显示页面提取的文本预览
+        # 将页面文本添加到总文本中
         if page_text_lines:
-            page_text_preview = ' '.join(page_text_lines)
-            if debug:
-                print(f"  📝 页面文本预览: {page_text_preview[:100]}...")
-            # 将页面文本添加到总文本中
             all_text_lines.extend(page_text_lines)
         else:
             print("  ⚠️ 本页未提取到文本")
     
     pdf_document.close()
     
-    # 统一处理所有文本，应用段落识别逻辑
+    # 智能处理文本段落
     print(f"\n🔄 处理提取的文本，共 {len(all_text_lines)} 行")
-    
-    if debug:
-        print("📝 所有提取的文本行预览:")
-        for i, line in enumerate(all_text_lines[:10]):  # 只显示前10行
-            print(f"  {i+1}: {line}")
-        if len(all_text_lines) > 10:
-            print(f"  ... 还有 {len(all_text_lines)-10} 行")
-    
-    # 使用改进的段落分割逻辑
     text_output = smart_paragraph_split(all_text_lines)
     
-    # 写入文本文件
-    text_file = os.path.join(output_dir, "description.txt")
+    # 保存文本文件
+    text_file = os.path.join(output_dir, "descriptions.txt")
     with open(text_file, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(text_output))  # 段落间用双换行分隔
+        f.write("\n\n".join(text_output))
     
-    # 同时保存原始提取的文本（调试用）
-    if debug:
-        debug_dir = os.path.join(output_dir, "debug")
-        raw_text_file = os.path.join(debug_dir, "raw_text.txt")
-        with open(raw_text_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(all_text_lines))
-        print(f"🔍 原始文本已保存: {raw_text_file}")
+    # 生成JSON文件
+    json_file = os.path.join(output_dir, "descriptions.json")
+    try:
+        convert_text_to_json(text_file, json_file)
+        print(f"✅ JSON文件已生成: {json_file}")
+    except Exception as e:
+        print(f"⚠️ JSON转换失败: {str(e)}")
     
     return len(text_output), img_counter, table_counter
 
-def smart_extract_pdf(pdf_path, output_dir, debug=False):
+def convert_text_to_json(text_file, json_file):
+    """
+    将提取的文本转换为结构化JSON格式
+    
+    Args:
+        text_file: 输入的txt文件路径
+        json_file: 输出的json文件路径
+    """
+    import json
+    
+    # 定义所有可能的部分标题
+    SECTIONS = {
+        "技术领域": ["技术领域"],
+        "背景技术": ["背景技术"],
+        "发明内容": ["发明内容", "实用新型内容"],
+        "附图说明": ["附图说明"],
+        "具体实施方式": ["具体实施方式", "具体实施例"]
+    }
+    
+    # 初始化结构
+    result = {
+        "题目": [],
+        "技术领域": [],
+        "背景技术": [],
+        "发明内容/实用新型内容": [],
+        "附图说明": [],
+        "具体实施方式": []
+    }
+    
+    # 读取文本文件
+    with open(text_file, 'r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f.readlines() if line.strip()]
+    
+    # 提取题目 (第一行)
+    if lines:
+        result["题目"].append(lines[0])
+        lines = lines[1:]  # 移除题目行
+    
+    # 查找各个部分的起始位置
+    section_positions = {}
+    current_section = None
+    
+    for i, line in enumerate(lines):
+        stripped_line = line.strip().replace(" ", "")
+        
+        # 检查是否是小标题
+        for section, aliases in SECTIONS.items():
+            if stripped_line in aliases:
+                section_positions[i] = section
+                current_section = section
+                break
+    
+    # 按顺序提取各个部分的内容
+    if section_positions:
+        # 将位置信息转换为排序后的列表
+        sorted_positions = sorted(section_positions.items())
+        
+        # 处理各个部分
+        for i, (pos, section) in enumerate(sorted_positions):
+            start = pos + 1  # 跳过标题行
+            
+            # 确定结束位置
+            if i < len(sorted_positions) - 1:
+                end = sorted_positions[i + 1][0]
+            else:
+                end = len(lines)
+            
+            # 提取当前部分的内容
+            content = lines[start:end]
+            result[section].extend([line for line in content if line.strip()])
+    
+    # 写入JSON文件
+    with open(json_file, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    
+    return result
+
+# 在 smart_extract_pdf 函数的最后添加 JSON 转换
+def smart_extract_pdf(pdf_path, output_dir):
     """智能PDF提取 - 自动判断类型并选择合适的处理方法"""
     
     print(f"🚀 开始智能处理PDF: {os.path.basename(pdf_path)}")
@@ -655,26 +773,35 @@ def smart_extract_pdf(pdf_path, output_dir, debug=False):
     
     # 第二步：选择对应的处理方法
     if pdf_type == 'text':
-        paragraphs, images, tables = extract_text_pdf_fixed(pdf_path, output_dir)  # 使用修复版
+        paragraphs, images, tables = extract_text_pdf(pdf_path, output_dir)  # 使用修复版
     elif pdf_type == 'image':
-        paragraphs, images, tables = extract_image_pdf(pdf_path, output_dir, debug=debug)
+        paragraphs, images, tables = extract_image_pdf(pdf_path, output_dir)
     else:  # mixed
         print("📄🖼️ 混合型PDF，使用修复版文本模式处理（主要逻辑）+ OCR补充")
         # 混合型使用修复版文本模式，后续可以优化为逐页判断
-        paragraphs, images, tables = extract_text_pdf_fixed(pdf_path, output_dir)
+        paragraphs, images, tables = extract_text_pdf(pdf_path, output_dir)
+        
+        print(f"\n✅ 处理完成！")
+        print(f"   📊 PDF类型: {pdf_type}")
+        print(f"   📄 段落数: {paragraphs}")
+        print(f"   📷 图片数: {images}")
+        
+        # 修正：使用正确的文件名
+        text_file = os.path.join(output_dir, "descriptions.txt")  # 修改这里
+        json_file = os.path.join(output_dir, "descriptions.json") # 修改这里
     
-    print(f"\n✅ 处理完成！")
-    print(f"   📊 PDF类型: {pdf_type}")
-    print(f"   📄 段落数: {paragraphs}")
-    print(f"   📷 图片数: {images}")
-    print(f"   📋 表格数: {tables}")
-    print(f"   📁 输出目录: {output_dir}")
+    try:
+        json_content = convert_text_to_json(text_file, json_file)
+        print(f"   📋 JSON文件已生成: {json_file}")
+    except Exception as e:
+        print(f"⚠️ JSON转换失败: {str(e)}")
     
     return {
         'pdf_type': pdf_type,
         'paragraphs': paragraphs,
         'images': images,
-        'tables': tables
+        'tables': tables,
+        'json_file': json_file if 'json_file' in locals() else None
     }
 
 # 用法示例
@@ -683,24 +810,17 @@ if __name__ == "__main__":
     output_dir = "output_descriptions"
     
     try:
-        # 开启调试模式以获得更详细的输出和中间文件
-        result = smart_extract_pdf(pdf_path, output_dir, debug=True)
+        result = smart_extract_pdf(pdf_path, output_dir)
         
         print(f"\n🎉 全部完成！输出文件：")
-        print(f"   📄 text.txt - 结构化文本 ({result['paragraphs']} 段落)")
+        print(f"   📄 descriptions.txt - 结构化文本 ({result['paragraphs']} 段落)")  # 修改这里
         print(f"   📁 images/ - {result['images']} 个图片 + {result['tables']} 个表格")
         print(f"   🔍 PDF类型: {result['pdf_type']}")
         
-        # 如果是调试模式，还会生成debug文件夹
-        debug_dir = os.path.join(output_dir, "debug")
-        if os.path.exists(debug_dir):
-            print(f"   🔍 debug/ - 调试文件（原始图片、处理后图片、原始文本等）")
+        # 如果有JSON文件，显示路径
+        if result.get('json_file'):
+            print(f"   📋 JSON文件: {result['json_file']}")
         
     except ImportError as e:
         print(f"❌ 依赖库缺失: {str(e)}")
         print("💡 请安装: pip install paddlepaddle paddleocr PyMuPDF opencv-python pdfplumber pillow")
-        
-    except Exception as e:
-        print(f"❌ 处理失败: {str(e)}")
-        import traceback
-        traceback.print_exc()
