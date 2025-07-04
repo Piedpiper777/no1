@@ -3,7 +3,7 @@ import os
 from sentence_transformers import SentenceTransformer
 
 # 推荐的中文编码模型（按优先级排序）
-MODEL_PATH = r"/home/zhanggu/Project/tianchi/model/text2vec-base-chinese"  
+MODEL_PATH = r"/workspace/no1/model/text2vec-base-chinese"  
 
 # 初始化模型
 model = SentenceTransformer(MODEL_PATH)

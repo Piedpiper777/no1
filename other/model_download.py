@@ -2,7 +2,7 @@ from modelscope import snapshot_download
 import os
 
 # 指定下载目录
-model_save_dir = "/home/zhanggu/Project/tianchi/model"
+model_save_dir = "/workspace/no1/model"
 
 # 确保目录存在
 os.makedirs(model_save_dir, exist_ok=True)

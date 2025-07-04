@@ -4,3 +4,5 @@ __pycache__/
 output/
 documents/
 model/
+test_do/
+data.json

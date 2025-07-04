@@ -63,7 +63,7 @@ def detect_pdf_type(pdf_path, sample_pages=3):
         print(f"📄 检测结果: 文本型PDF (文本页: {text_pages}/{total_checked})")
     elif text_ratio <= 0.2:
         pdf_type = 'image'
-        print(f"🖼️  检测结果: 图片型PDF (图片页: {image_pages}/{total_checked})")
+        print(f"🖼️  棜测结果: 图片型PDF (图片页: {image_pages}/{total_checked})")
     else:
         pdf_type = 'mixed'
         print(f"📄🖼️  检测结果: 混合型PDF (文本页: {text_pages}, 图片页: {image_pages})")
@@ -398,14 +398,6 @@ def extract_text_pdf(pdf_path, output_dir):
     with open(text_file, "w", encoding="utf-8") as f:
         f.write("\n\n".join(text_output))
     
-    # 生成JSON文件
-    json_file = os.path.join(output_dir, "descriptions.json")
-    try:
-        convert_text_to_json(text_file, json_file)
-        print(f"✅ JSON文件已生成: {json_file}")
-    except Exception as e:
-        print(f"⚠️ JSON转换失败: {str(e)}")
-    
     print(f"✅ 文本提取完成，共 {len(text_output)} 个段落")
     return len(text_output), img_counter, table_counter
 
@@ -675,14 +667,6 @@ def extract_image_pdf(pdf_path, output_dir):
     with open(text_file, "w", encoding="utf-8") as f:
         f.write("\n\n".join(text_output))
     
-    # 生成JSON文件
-    json_file = os.path.join(output_dir, "descriptions.json")
-    try:
-        convert_text_to_json(text_file, json_file)
-        print(f"✅ JSON文件已生成: {json_file}")
-    except Exception as e:
-        print(f"⚠️ JSON转换失败: {str(e)}")
-    
     return len(text_output), img_counter, table_counter
 
 def convert_text_to_json(text_file, json_file):
@@ -781,32 +765,21 @@ def smart_extract_pdf(pdf_path, output_dir):
         # 混合型使用修复版文本模式，后续可以优化为逐页判断
         paragraphs, images, tables = extract_text_pdf(pdf_path, output_dir)
         
-        print(f"\n✅ 处理完成！")
-        print(f"   📊 PDF类型: {pdf_type}")
-        print(f"   📄 段落数: {paragraphs}")
-        print(f"   📷 图片数: {images}")
-        
-        # 修正：使用正确的文件名
-        text_file = os.path.join(output_dir, "descriptions.txt")  # 修改这里
-        json_file = os.path.join(output_dir, "descriptions.json") # 修改这里
-    
-    try:
-        json_content = convert_text_to_json(text_file, json_file)
-        print(f"   📋 JSON文件已生成: {json_file}")
-    except Exception as e:
-        print(f"⚠️ JSON转换失败: {str(e)}")
+    print(f"\n✅ 处理完成！")
+    print(f"   📊 PDF类型: {pdf_type}")
+    print(f"   📄 段落数: {paragraphs}")
+    print(f"   📷 图片数: {images}")
     
     return {
         'pdf_type': pdf_type,
         'paragraphs': paragraphs,
         'images': images,
-        'tables': tables,
-        'json_file': json_file if 'json_file' in locals() else None
+        'tables': tables
     }
 
 # 用法示例
 if __name__ == "__main__":
-    pdf_path = r"/workspace/project/output/descriptions.pdf"
+    pdf_path = r"/workspace/no1/test_do/CN212149980U.pdf"
     output_dir = "output_descriptions"
     
     try:
@@ -816,10 +789,6 @@ if __name__ == "__main__":
         print(f"   📄 descriptions.txt - 结构化文本 ({result['paragraphs']} 段落)")  # 修改这里
         print(f"   📁 images/ - {result['images']} 个图片 + {result['tables']} 个表格")
         print(f"   🔍 PDF类型: {result['pdf_type']}")
-        
-        # 如果有JSON文件，显示路径
-        if result.get('json_file'):
-            print(f"   📋 JSON文件: {result['json_file']}")
         
     except ImportError as e:
         print(f"❌ 依赖库缺失: {str(e)}")

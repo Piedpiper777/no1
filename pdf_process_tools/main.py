@@ -1,11 +1,11 @@
 import os 
 import shutil
 import glob
-from pdf_process_tools.pdf_split import PatentPDFSplitter
-from pdf_process_tools.claims_ocr import extract_text_from_pdf
-from pdf_process_tools.front import extract_first_page_figure
-from pdf_process_tools.draw import extract_figures_by_label
-from pdf_process_tools.descriptions_ocr import detect_pdf_type, extract_text_pdf, extract_image_pdf
+from pdf_split import PatentPDFSplitter
+from claims_ocr import extract_text_from_pdf
+from front import extract_first_page_figure
+from draw import extract_figures_by_label
+from descriptions_ocr import detect_pdf_type, extract_text_pdf, extract_image_pdf
 import fitz  # PyMuPDF
 
 def flatten_descriptions_output(output_dir):
@@ -107,6 +107,6 @@ def main(pdf_path, output_dir):
     print(f"处理完成，结果保存到: {output_dir}")
 
 if __name__ == "__main__":
-    input_pdf_path = r"/workspace/project/documents/CN212384434U.pdf"  # 替换为你的路径
+    input_pdf_path = r"/workspace/no1/test_do/CN212149980U.pdf"  # 替换为你的路径
     output_dir = "output"
     main(input_pdf_path, output_dir)
